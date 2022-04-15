@@ -1,110 +1,25 @@
 version: 2.1
 
-executors:
-  windows-large:
+orbs:
+  win-perf-diag: circle-makotom-orbs/windows-performance-diagnosis@volatile
+
+jobs:
+  build:
     machine:
       image: windows-server-2019-vs2019:stable
     resource_class: windows.large
-
-commands:
-  # https://social.technet.microsoft.com/Forums/office/ja-JP/f83b6e6c-7188-4cfa-bca1-54c375c21499/12497125011245712540125101253112473
-  start-perflog:
-    parameters:
-      output-dir:
-        description: The name of the folder where performance logs will be saved
-        type: string
-        default: 'C:\Circle-Perf-Triage'
-      collector-name:
-        description: The name of the data collector set
-        type: string
-        default: Circle-Perf-Triage
-    steps:
-      - run:
-          name: Create a data collector set
-          shell: powershell.exe
-          command: |
-            logman create counter "<< parameters.collector-name >>" -c "\Cache\*" "\LogicalDisk(*)\*" "\Memory\*" "\Network Adapter(*)\*" "\Network Interface(*)\*" "\PhysicalDisk(*)\*" "\Process(*)\*" "\Processor(*)\*" "\Processor Information(*)\*" "\Server\*" "\System\*" "\Paging File(*)\*" "\Database(*)\*" "\Server Work Queues(*)\*" "\Objects\*" -si 00:00:01 -v NNNNNN -o "<< parameters.output-dir >>\Circle-Perf-Triage"
-      - run:
-          name: Start performance counters
-          shell: cmd.exe
-          command: logman start << parameters.collector-name >>
-
-  stop-and-save-perflog:
-    parameters:
-      output-dir:
-        description: The name of the folder where performance logs will be saved
-        type: string
-        default: 'C:\Circle-Perf-Triage'
-      collector-name:
-        description: The name of the data collector set
-        type: string
-        default: Circle-Perf-Triage
-    steps:
-      - run:
-          name: Stop performance counters
-          when: always
-          shell: cmd.exe
-          command: logman stop << parameters.collector-name >>
-      - store_artifacts:
-          path: << parameters.output-dir >>
-
-  start-wpr-recording:
-    steps:
-      - run:
-          shell: cmd.exe
-          command: wpr -start GeneralProfile
-
-  stop-and-save-wpr-recording:
-    parameters:
-      file:
-        description: The name of the ETL file as the output
-        type: string
-        default: wpr.etl
-    steps:
-      - run:
-          when: always
-          shell: powershell.exe
-          command: wpr -stop "<< parameters.file >>"
-      - store_artifacts:
-          path: << parameters.file >>
-
-  record-wpr:
-    parameters:
-      file:
-        description: The name of the ETL file as the output
-        type: string
-        default: wpr.etl
-      recording-duration:
-        description: The duration of the WPR recording in seconds
-        type: integer
-        default: 60
-      cue-duration:
-        description: The cue time in seconds before we actually start recording
-        type: integer
-        default: 10
-    steps:
-      - run:
-          name: Record WPR for the next << parameters.recording-duration >> seconds (after a << parameters.cue-duration >>-second cue)
-          background: true
-          shell: powershell.exe
-          command: |
-            Start-Sleep << parameters.cue-duration >>
-            wpr -start GeneralProfile
-            Start-Sleep << parameters.recording-duration >>
-            wpr -stop << parameters.file >>
-
-jobs:
-  # The basic usage
-  # Bear in mind that ETL files for WPR can grow ~= 500 MB for each minute
-  # and we will have difficulties in opening them if the size exceeds a couple of gigabytes
-  for-a-short-step:
-    executor: windows-large
     steps:
       - checkout
-      - start-perflog
-      - start-wpr-recording
+
+      # Start recording
+      - win-perf-diag/start-perflog
+      - win-perf-diag/record-wpr-in-background:
+          for-sec: 100
+          split-by-sec: 30
+
+      # This is the part to be diagnosed
       - run:
-          name: Do something for 30 seconds
+          name: Do something for 120 seconds
           shell: powershell.exe
           command: |
             $ErrorActionPreference = "Stop"
@@ -112,66 +27,18 @@ jobs:
             Write-Host "Starting..."
 
             $procs = @()
-            foreach ($iter in 0..7) {
-              $procs += Start-Process -PassThru .\FlipFlop.exe 2048
+            foreach ($iter in 0..4) {
+                $procs += Start-Process -PassThru ./FlipFlop.exe 3072
             }
 
-            Start-Sleep 30
+            Start-Sleep 120
 
             foreach ($proc in $procs) {
-              Stop-Process $proc
+                Stop-Process $proc
             }
 
             Write-Host "DONE."
-      - stop-and-save-wpr-recording
-      - stop-and-save-perflog
 
-  # If you cannot make a WPR record entirely (due to the file size limitation)
-  # consider running WPR in background for a part of the task to investigate
-  for-a-step-longer-than-60s:
-    executor: windows-large
-    parameters:
-      wpr-file:
-        type: string
-        default: wpr.etl
-    steps:
-      - checkout
-      - start-perflog
-      - record-wpr:
-          file: << parameters.wpr-file >>
-          recording-duration: 30
-          cue-duration: 0
-      # Make sure that tasks below take _much_ longer than (`cue-duration` + `recording-duration` + some buffer) seconds
-      # Otherwise the job ends before stopping/saving WPR and you will get nothing
-      - run:
-          name: Do something for 90 seconds
-          shell: powershell.exe
-          command: |
-            $ErrorActionPreference = "Stop"
-
-            Write-Host "Starting..."
-
-            $procs = @()
-            foreach ($iter in 0..7) {
-              $procs += Start-Process -PassThru .\FlipFlop.exe 2048
-            }
-
-            Start-Sleep 30
-
-            foreach ($proc in $procs) {
-              Stop-Process $proc
-            }
-
-            Start-Sleep 60
-
-            Write-Host "DONE."
-      - stop-and-save-perflog
-      # DO NOT FORGET to store the resulting ETL file for the WPR recording manually!
-      - store_artifacts:
-          path: << parameters.wpr-file >>
-
-workflows:
-  run:
-    jobs:
-      - for-a-short-step
-      - for-a-step-longer-than-60s
+      # Stop recording and save records
+      - win-perf-diag/ensure-and-save-wpr
+      - win-perf-diag/stop-and-save-perflog
